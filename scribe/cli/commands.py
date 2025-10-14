@@ -24,6 +24,43 @@ def copilot_impl(args=None, provider_name: str = DEFAULT_PROVIDER, verbose=False
     provider = get_provider(provider_name)
     provider_display = provider.get_provider_display_name()
 
+    # Check for --container flag and resource limit flags
+    use_container = False
+    memory_limit = None
+    cpu_limit = None
+    project_dir = None
+
+    if args:
+        filtered_args = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--container":
+                use_container = True
+            elif arg == "--memory-limit" and i + 1 < len(args):
+                memory_limit = args[i + 1]
+                i += 1
+            elif arg == "--cpu-limit" and i + 1 < len(args):
+                cpu_limit = args[i + 1]
+                i += 1
+            elif arg == "--project-dir" and i + 1 < len(args):
+                project_dir = args[i + 1]
+                i += 1
+            else:
+                filtered_args.append(arg)
+            i += 1
+        args = filtered_args
+
+    # Set environment variables for container mode
+    if use_container:
+        os.environ["SCRIBE_USE_CONTAINER"] = "1"
+        if memory_limit:
+            os.environ["SCRIBE_MEMORY_LIMIT"] = memory_limit
+        if cpu_limit:
+            os.environ["SCRIBE_CPU_LIMIT"] = cpu_limit
+        if project_dir:
+            os.environ["SCRIBE_PROJECT_DIR"] = project_dir
+
     # Give terminal a nice title for Gemini CLI
     if provider_name == "gemini":
         os.environ["CLI_TITLE"] = "Scribe - Copilot"
@@ -33,7 +70,8 @@ def copilot_impl(args=None, provider_name: str = DEFAULT_PROVIDER, verbose=False
     os.environ["SCRIBE_SESSION_ID"] = session_id
 
     try:
-        click.echo(f"\n🚀 Launching {provider_display} with Scribe notebook tools enabled...\n")
+        mode_msg = " (containerized)" if use_container else ""
+        click.echo(f"\n🚀 Launching {provider_display} with Scribe notebook tools enabled{mode_msg}...\n")
         python_path = get_python_path()
 
         if provider_name == "claude":

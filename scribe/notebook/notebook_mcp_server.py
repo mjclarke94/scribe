@@ -21,6 +21,8 @@ from scribe.notebook._notebook_server_utils import (
     check_server_health,
     start_scribe_server,
     cleanup_scribe_server,
+    start_scribe_server_container,
+    cleanup_scribe_server_container,
     process_jupyter_outputs,
 )  # noqa: E402
 
@@ -30,9 +32,11 @@ mcp = FastMCP("scribe")
 
 # Global server management
 _server_process: Optional[subprocess.Popen] = None
+_server_container_id: Optional[str] = None
 _server_port: Optional[int] = None
 _server_url: Optional[str] = None
 _server_token: Optional[str] = None
+_use_container: bool = os.environ.get("SCRIBE_USE_CONTAINER", "").lower() in ("1", "true", "yes")
 # Down the line, we may wish to keep the Jupyter server around even after MCP server exits
 _is_external_server: bool = False
 
@@ -42,8 +46,8 @@ SCRIBE_PROVIDER: str = os.environ.get("SCRIBE_PROVIDER")
 _active_sessions: set = set()
 
 
-def start_jupyter_server() -> tuple[subprocess.Popen, int, str]:
-    """Start a Jupyter server subprocess and return process, port, and URL."""
+def start_jupyter_server() -> tuple[Union[subprocess.Popen, str], int, str]:
+    """Start a Jupyter server (subprocess or container) and return process/container_id, port, and URL."""
     port = find_safe_port()
     if port is None:
         raise Exception("Could not find an available port for Jupyter server")
@@ -54,26 +58,47 @@ def start_jupyter_server() -> tuple[subprocess.Popen, int, str]:
     # Get notebook output directory from environment variable
     notebook_output_dir = os.environ.get("NOTEBOOK_OUTPUT_DIR")
 
-    # Use utils function to start server
-    process = start_scribe_server(port, token, notebook_output_dir)
+    # Get resource limits from environment
+    memory_limit = os.environ.get("SCRIBE_MEMORY_LIMIT")
+    cpu_limit = os.environ.get("SCRIBE_CPU_LIMIT")
+    project_dir = os.environ.get("SCRIBE_PROJECT_DIR")
+
     url = f"http://127.0.0.1:{port}"
 
-    return process, port, url
+    if _use_container:
+        # Start in container
+        container_id = start_scribe_server_container(
+            port=port,
+            token=token,
+            notebook_output_dir=notebook_output_dir,
+            project_dir=project_dir,
+            memory_limit=memory_limit,
+            cpu_limit=cpu_limit,
+        )
+        return container_id, port, url
+    else:
+        # Start as subprocess
+        process = start_scribe_server(port, token, notebook_output_dir)
+        return process, port, url
 
 
 def cleanup_server():
     """Clean up the managed Jupyter server."""
-    global _server_process, _server_token, _active_sessions
+    global _server_process, _server_container_id, _server_token, _active_sessions
 
-    if _server_process and not _is_external_server:
-        cleanup_scribe_server(_server_process)
-        _server_process = None
+    if not _is_external_server:
+        if _use_container and _server_container_id:
+            cleanup_scribe_server_container(_server_container_id)
+            _server_container_id = None
+        elif _server_process:
+            cleanup_scribe_server(_server_process)
+            _server_process = None
         _server_token = None  # Clear token on cleanup
 
 
 def ensure_server_running() -> str:
     """Ensure a Jupyter server is running and return its URL."""
-    global _server_process, _server_port, _server_url, _is_external_server
+    global _server_process, _server_container_id, _server_port, _server_url, _is_external_server
 
     # Check if SCRIBE_PORT is set (external server)
     if "SCRIBE_PORT" in os.environ:
@@ -84,19 +109,32 @@ def ensure_server_running() -> str:
         return _server_url
 
     # Check if our managed server is still running
-    if _server_process and _server_process.poll() is None:
-        return _server_url
+    if _use_container:
+        # For containers, check if container is running
+        if _server_container_id:
+            # TODO: Could check docker ps here, but URL health check will catch issues
+            return _server_url
+    else:
+        # For processes, check if process is alive
+        if _server_process and _server_process.poll() is None:
+            return _server_url
 
     # Start a new managed server
     _is_external_server = False
-    _server_process, _server_port, _server_url = start_jupyter_server()
+    process_or_container, _server_port, _server_url = start_jupyter_server()
+
+    if _use_container:
+        _server_container_id = process_or_container
+    else:
+        _server_process = process_or_container
 
     # Register cleanup handlers
     atexit.register(cleanup_server)
     signal.signal(signal.SIGTERM, lambda sig, frame: cleanup_server())
     signal.signal(signal.SIGINT, lambda sig, frame: cleanup_server())
 
-    print(f"Started managed Jupyter server at {_server_url}", file=sys.stderr)
+    mode = "container" if _use_container else "subprocess"
+    print(f"Started managed Jupyter server ({mode}) at {_server_url}", file=sys.stderr)
     return _server_url
 
 
@@ -361,7 +399,7 @@ async def start_session_continue_notebook(
 
 @mcp.tool
 async def execute_code(
-    session_id: str, code: str
+    session_id: str, code: str, timeout: Optional[int] = None
 ) -> List[Union[Dict[str, Any], Image]]:
     """
     Execute Python code in the specified kernel session.
@@ -372,6 +410,7 @@ async def execute_code(
     Args:
         session_id: The session ID returned by start_session
         code: Python code to execute
+        timeout: Optional timeout in seconds for kernel execution (default: 30s)
 
     Returns:
         Dictionary containing:
@@ -385,9 +424,13 @@ async def execute_code(
         token = get_token()
         headers = {"Authorization": f"token {token}"} if token else {}
 
+        request_body = {"session_id": session_id, "code": code}
+        if timeout is not None:
+            request_body["timeout"] = timeout
+
         response = requests.post(
             f"{server_url}/api/scribe/exec",
-            json={"session_id": session_id, "code": code},
+            json=request_body,
             headers=headers,
         )
         response.raise_for_status()

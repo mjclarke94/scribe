@@ -29,7 +29,7 @@ To specify a particular CLI agent, use `scribe claude`, `scribe codex`, or `scri
 
 
 #### Start a new session
-Once you've launched the CLI agent, ask it to start a new session. This will create a `notebooks/` directory wherever you launched the `scribe` command from, and will create a notebook with the current timestamp and a name provided by the agent.  
+Once you've launched the CLI agent, ask it to start a new session. This will create a `notebooks/` directory wherever you launched the `scribe` command from, and will create a notebook with the current timestamp and a name provided by the agent.
 ```
 You: Start a new session for us to run some experiments on GPT-2.
 
@@ -37,6 +37,47 @@ Agent: I'll start a new Scribe session for image generation. [Tool call]
 
 Agent: Session started successfully! I've created a new notebook at notebooks/2025-01-09-10-30_GPT-2_Experiments.ipynb. Where should we begin?
 ```
+
+## Containerized Execution (Security)
+
+For enhanced security, you can run the Jupyter kernel in a Docker container. This provides isolation from your host system while still giving the kernel access to your project's dependencies.
+
+### Requirements
+- Docker installed and running
+- A `pyproject.toml` file in your project directory (uv-based project)
+
+### Usage
+
+```bash
+# Run with containerized kernel
+scribe claude --container
+
+# With resource limits
+scribe claude --container --memory-limit 2g --cpu-limit 1.0
+
+# Specify a custom project directory
+scribe claude --container --project-dir /path/to/project
+```
+
+### How it works
+
+When `--container` is enabled:
+1. A Docker image is built (cached after first build) with Python, uv, and Jupyter
+2. Your project directory is mounted into the container
+3. `uv sync` runs inside the container to install your project's dependencies (with native Linux binaries)
+4. The Jupyter server starts inside the container with full access to your synced environment
+5. Notebooks are saved to your host filesystem (mounted as a volume)
+
+**Benefits:**
+- **Filesystem isolation**: Code execution is isolated from your host system
+- **Resource limits**: Optional CPU and memory constraints
+- **Dependency isolation**: Packages are installed in the container, not on your host
+- **Easy cleanup**: Simply stop the container to remove all execution artifacts
+
+**Limitations:**
+- Slightly slower first startup (Docker build + uv sync)
+- Requires Docker to be installed and running
+- Project must use uv for dependency management
 
 ## Automatic MCP Permissions
 **Claude Code**  
@@ -48,5 +89,5 @@ When running `scribe codex`, Codex is launched with a command-line argument that
 **Gemini CLI**  
 When running `scribe gemini`, a `.gemini/settings.json` file is created (or updated if one already exists) with settings prepopulated to enable the MCP server with tool calls automatically enabled.  
 
-## Security Note  
-Agents can execute code via the Jupyter kernel that bypasses default CLI permissions. Use with caution.  
+## Security Note
+Agents can execute arbitrary Python code via the Jupyter kernel. For production use or when working with untrusted code, use the `--container` flag to run the kernel in an isolated Docker container. See the [Containerized Execution](#containerized-execution-security) section above for details.  

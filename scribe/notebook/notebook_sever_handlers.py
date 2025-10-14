@@ -75,9 +75,10 @@ class ExecuteCodeHandler(ScribeAPIHandler):
                 raise ValueError("No JSON body provided")
 
             session_id = data.get("session_id")
+            timeout = data.get("timeout")  # Optional timeout parameter
 
             result = await self.scribe_app.execute_code_in_kernel(
-                data["session_id"], data["code"]
+                data["session_id"], data["code"], timeout=timeout
             )
 
             # Add session_id to response

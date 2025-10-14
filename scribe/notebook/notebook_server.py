@@ -252,6 +252,7 @@ class ScribeServerApp(ServerApp):
             relative_path = nb_path
 
         # Create a kernel first to ensure it uses our current environment
+        # Don't specify kernel_name - just use default, which we've configured to use venv Python in container mode
         kernel_id = await self.kernel_manager.start_kernel()
 
         # Now create a session and associate it with our kernel
@@ -461,13 +462,17 @@ class ScribeServerApp(ServerApp):
         """Update a cell with a new output."""
         session = self.sessions.get(session_id)
         if not session:
+            print(f"[DEBUG] _update_cell_output: session {session_id} not found", file=sys.stderr)
             return
+
+        print(f"[DEBUG] _update_cell_output: Updating cell {cell_index} with output type {output['output_type']}", file=sys.stderr)
 
         # Read notebook
         with open(session.notebook_path, "r") as f:
             nb = nbformat.read(f, as_version=nbformat.NO_CONVERT)
 
         if cell_index >= len(nb.cells):
+            print(f"[DEBUG] _update_cell_output: cell_index {cell_index} >= len(cells) {len(nb.cells)}", file=sys.stderr)
             return
 
         cell = nb.cells[cell_index]
@@ -498,10 +503,12 @@ class ScribeServerApp(ServerApp):
                 traceback=output["traceback"],
             )
         else:
+            print(f"[DEBUG] _update_cell_output: Unknown output type {output['output_type']}", file=sys.stderr)
             return
 
         # Append output
         cell.outputs.append(cell_output)
+        print(f"[DEBUG] _update_cell_output: Cell now has {len(cell.outputs)} outputs", file=sys.stderr)
 
         # Update status
         cell.metadata["execution_status"] = status
@@ -510,8 +517,16 @@ class ScribeServerApp(ServerApp):
         with open(session.notebook_path, "w") as f:
             nbformat.write(clean_notebook_for_save(nb), f)
 
-    async def _execute_and_stream(self, session_id: str, code: str):
-        """Execute code and yield outputs as they arrive."""
+        print(f"[DEBUG] _update_cell_output: Wrote notebook to {session.notebook_path}", file=sys.stderr)
+
+    async def _execute_and_stream(self, session_id: str, code: str, timeout: Optional[int] = None):
+        """Execute code and yield outputs as they arrive.
+
+        Args:
+            session_id: The session ID
+            code: Code to execute
+            timeout: Optional timeout in seconds (default: 30)
+        """
         session = self.sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
@@ -529,18 +544,28 @@ class ScribeServerApp(ServerApp):
             execution_count = None
 
             # Stream outputs as they arrive
+            # Use provided timeout or default to 30 seconds
+            msg_timeout = timeout if timeout is not None else 30
+
             while True:
                 try:
                     # Use async get_iopub_msg
                     msg = await client._async_get_iopub_msg(
-                        timeout=300
-                    )  # 5 minute timeout
-
-                    if msg["parent_header"].get("msg_id") != msg_id:
-                        continue
+                        timeout=msg_timeout
+                    )
 
                     msg_type = msg["msg_type"]
                     content = msg["content"]
+
+                    # Debug: Log message types
+                    print(f"[DEBUG] Received message: type={msg_type}, parent_match={msg['parent_header'].get('msg_id') == msg_id}", file=sys.stderr)
+
+                    # Skip messages not from our execution (except status messages)
+                    if msg["parent_header"].get("msg_id") != msg_id:
+                        # Status messages can sometimes have empty parent headers, check anyway
+                        if msg_type == "status":
+                            print(f"[DEBUG] Status message: {content.get('execution_state')}, checking if we should exit", file=sys.stderr)
+                        continue
 
                     if msg_type == "execute_input":
                         execution_count = content["execution_count"]
@@ -572,17 +597,30 @@ class ScribeServerApp(ServerApp):
                             "traceback": content["traceback"],
                         }
                     elif msg_type == "status" and content["execution_state"] == "idle":
+                        print(f"[DEBUG] Kernel idle, breaking out of loop", file=sys.stderr)
                         break
 
                 except Exception as e:
-                    print(f"Error collecting output: {e}")
+                    # Import queue.Empty to check for timeout
+                    from queue import Empty
+                    import traceback
+
+                    # If we got a queue.Empty exception, it means no more messages are coming
+                    # This is normal - break out of the loop
+                    if isinstance(e, Empty):
+                        print(f"[DEBUG] No more messages (timeout/queue empty), ending execution", file=sys.stderr)
+                        break
+
+                    # For other exceptions, log and break
+                    print(f"[ERROR] Error collecting output: {e}", file=sys.stderr)
+                    print(f"[ERROR] Traceback: {traceback.format_exc()}", file=sys.stderr)
                     break
 
         finally:
             client.stop_channels()
 
     async def execute_code_in_kernel(
-        self, session_id: str, code: str, skip_notebook_update: bool = False
+        self, session_id: str, code: str, skip_notebook_update: bool = False, timeout: Optional[int] = None
     ):
         """Execute code in a kernel with immediate notebook updates.
 
@@ -590,6 +628,7 @@ class ScribeServerApp(ServerApp):
             session_id: The session ID
             code: The code to execute
             skip_notebook_update: If True, skip showing pending results as they're being computed
+            timeout: Optional timeout in seconds for kernel execution (default: 30s)
         """
         # Update activity timestamp
         self.update_activity()
@@ -603,21 +642,29 @@ class ScribeServerApp(ServerApp):
         # (Unless we're restoring -- in that case we just add code after it finishes running for simplicity)
         if not skip_notebook_update:
             cell_index = await self._add_pending_cell(session_id, code)
+            print(f"[DEBUG] execute_code_in_kernel: Added pending cell at index {cell_index}", file=sys.stderr)
         else:
             cell_index = None
+            print(f"[DEBUG] execute_code_in_kernel: Skipping notebook update (cell_index=None)", file=sys.stderr)
 
         # Phase 2: Execute and stream outputs
         outputs = []
         execution_count = session.execution_count
 
+        print(f"[DEBUG] execute_code_in_kernel: Starting execution loop, cell_index={cell_index}", file=sys.stderr)
+
         try:
-            async for output in self._execute_and_stream(session_id, code):
+            async for output in self._execute_and_stream(session_id, code, timeout=timeout):
+                print(f"[DEBUG] execute_code_in_kernel: Got output of type {output.get('output_type')}", file=sys.stderr)
                 outputs.append(output)
                 # Phase 3: Update notebook with each output as it arrives (only if we added a cell)
                 if cell_index is not None:
+                    print(f"[DEBUG] execute_code_in_kernel: Calling _update_cell_output for cell {cell_index}", file=sys.stderr)
                     await self._update_cell_output(
                         session_id, cell_index, output, status="running"
                     )
+                else:
+                    print(f"[DEBUG] execute_code_in_kernel: Skipping _update_cell_output (cell_index is None)", file=sys.stderr)
 
             # Mark as complete
             if cell_index is not None:
